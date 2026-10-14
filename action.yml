@@ -1,5 +1,5 @@
 name: "bugzero auto-fix"
-description: "Run the bugzero agent in your own runner to open a PR fixing a reported error. Your code never leaves your infrastructure."
+description: "The bugzero bug-fixing agent: turns a Sentry or PostHog error into a pull request, in your own runner with your own AI key."
 author: "bugzero"
 branding:
   icon: "git-pull-request"

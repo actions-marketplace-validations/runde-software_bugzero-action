@@ -21958,14 +21958,9 @@ function isUndiciDispatcherVersionMismatchError(error) {
 }
 
 // action/src/agent/llm.ts
+var MAX_OUTPUT_TOKENS = 64e3;
 var ANTHROPIC_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
-function anthropicEffort(e) {
-  return ANTHROPIC_EFFORTS.includes(e) ? e : "high";
-}
-var OPENAI_EFFORTS = ["minimal", "low", "medium", "high"];
-function openaiEffort(e) {
-  return OPENAI_EFFORTS.includes(e) ? e : "medium";
-}
+var OPENAI_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 function safeJson(s) {
   try {
     const v = JSON.parse(s);
@@ -21974,11 +21969,39 @@ function safeJson(s) {
     return {};
   }
 }
+function sleep3(ms, signal) {
+  return new Promise((resolve4, reject) => {
+    const t = setTimeout(resolve4, ms);
+    signal.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(t);
+        reject(signal.reason);
+      },
+      { once: true }
+    );
+  });
+}
+function isRetryable(err) {
+  const status = err?.status;
+  if (status && [408, 409, 429, 500, 502, 503, 504, 529].includes(status)) return true;
+  const message = err instanceof Error ? err.message : String(err);
+  return /overloaded|rate.?limit|ECONNRESET|socket hang up/i.test(message);
+}
+async function withRetries(call, signal) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await call();
+    } catch (err) {
+      if (signal.aborted || attempt >= 2 || !isRetryable(err)) throw err;
+      await sleep3(3e3 * (attempt + 1), signal);
+    }
+  }
+}
 var AnthropicAdapter = class {
   client;
   model;
   effort;
-  adaptiveThinking;
   system;
   tools;
   messages;
@@ -21986,25 +22009,26 @@ var AnthropicAdapter = class {
   constructor(o) {
     this.client = new Anthropic({ apiKey: o.apiKey });
     this.model = o.model;
-    this.effort = anthropicEffort(o.effort);
-    this.adaptiveThinking = o.adaptiveThinking;
+    this.effort = ANTHROPIC_EFFORTS.includes(o.effort) ? o.effort : null;
     this.system = [
       { type: "text", text: o.system, cache_control: { type: "ephemeral" } }
     ];
     this.tools = o.tools;
     this.messages = [{ role: "user", content: o.userMessage }];
   }
-  async next() {
+  async next(signal) {
     const params = {
       model: this.model,
-      max_tokens: this.adaptiveThinking ? 16e3 : 8192,
+      max_tokens: MAX_OUTPUT_TOKENS,
       system: this.system,
       tools: this.tools,
       messages: this.messages,
-      output_config: { effort: this.effort }
+      ...this.effort ? { output_config: { effort: this.effort } } : {}
     };
-    if (this.adaptiveThinking) params.thinking = { type: "adaptive" };
-    const res = await this.client.messages.create(params);
+    const res = await withRetries(
+      () => this.client.messages.stream(params, { signal }).finalMessage(),
+      signal
+    );
     this.messages.push({ role: "assistant", content: res.content });
     let text = "";
     const toolCalls = [];
@@ -22017,17 +22041,31 @@ var AnthropicAdapter = class {
           input: block.input ?? {}
         });
     }
-    return {
-      text,
-      toolCalls,
-      done: res.stop_reason !== "tool_use",
-      usage: {
-        inputFull: res.usage.input_tokens ?? 0,
-        cacheWrite: res.usage.cache_creation_input_tokens ?? 0,
-        cacheRead: res.usage.cache_read_input_tokens ?? 0,
-        output: res.usage.output_tokens ?? 0
-      }
+    const usage = {
+      inputFull: res.usage.input_tokens ?? 0,
+      cacheWrite: res.usage.cache_creation_input_tokens ?? 0,
+      cacheRead: res.usage.cache_read_input_tokens ?? 0,
+      output: res.usage.output_tokens ?? 0
     };
+    if (res.stop_reason === "max_tokens") {
+      return {
+        text,
+        toolCalls: [],
+        done: true,
+        failure: "The model ran out of output tokens in the middle of a step.",
+        usage
+      };
+    }
+    if (res.stop_reason === "refusal") {
+      return {
+        text,
+        toolCalls: [],
+        done: true,
+        failure: "The model declined to continue this task.",
+        usage
+      };
+    }
+    return { text, toolCalls, done: res.stop_reason !== "tool_use", usage };
   }
   submitToolResults(results) {
     const blocks = results.map((r) => ({
@@ -22049,69 +22087,89 @@ var OpenAIAdapter = class {
   client;
   model;
   effort;
+  system;
+  cacheKey;
   tools;
-  messages;
+  input;
   constructor(o) {
     this.client = new OpenAI({ apiKey: o.apiKey });
     this.model = o.model;
-    this.effort = openaiEffort(o.effort);
+    this.effort = OPENAI_EFFORTS.includes(o.effort) ? o.effort : null;
+    this.system = o.system;
+    this.cacheKey = o.cacheKey;
     this.tools = o.tools.map((t) => ({
       type: "function",
-      function: {
-        name: t.name,
-        description: t.description,
-        parameters: t.input_schema
-      }
+      name: t.name,
+      description: t.description ?? null,
+      parameters: t.input_schema,
+      // Our schemas have optional fields; strict mode would require all of them.
+      strict: false
     }));
-    this.messages = [
-      { role: "system", content: o.system },
-      { role: "user", content: o.userMessage }
-    ];
+    this.input = [{ role: "user", content: o.userMessage }];
   }
-  async next() {
-    const res = await this.client.chat.completions.create({
-      model: this.model,
-      messages: this.messages,
-      tools: this.tools,
-      reasoning_effort: this.effort,
-      max_completion_tokens: 16e3
-    });
-    const msg = res.choices[0]?.message;
-    const fnCalls = (msg?.tool_calls ?? []).filter(
-      (tc) => tc.type === "function"
+  async next(signal) {
+    const res = await withRetries(
+      () => this.client.responses.stream(
+        {
+          model: this.model,
+          instructions: this.system,
+          input: this.input,
+          tools: this.tools,
+          // The SDK's types predate efforts like "max"; the API accepts them.
+          ...this.effort ? { reasoning: { effort: this.effort } } : {},
+          max_output_tokens: MAX_OUTPUT_TOKENS,
+          store: false,
+          include: ["reasoning.encrypted_content"],
+          prompt_cache_key: this.cacheKey
+        },
+        { signal }
+      ).finalResponse(),
+      signal
     );
-    const assistant = { role: "assistant", content: msg?.content ?? "" };
-    if (fnCalls.length) {
-      assistant.tool_calls = fnCalls.map((tc) => ({
-        id: tc.id,
-        type: "function",
-        function: { name: tc.function.name, arguments: tc.function.arguments }
-      }));
-    }
-    this.messages.push(assistant);
-    const toolCalls = fnCalls.map((tc) => ({
-      id: tc.id,
-      name: tc.function.name,
-      input: safeJson(tc.function.arguments)
-    }));
-    return {
-      text: msg?.content ? msg.content + "\n" : "",
-      toolCalls,
-      done: fnCalls.length === 0,
-      usage: {
-        inputFull: res.usage?.prompt_tokens ?? 0,
-        cacheWrite: 0,
-        cacheRead: 0,
-        output: res.usage?.completion_tokens ?? 0
+    this.input.push(...res.output);
+    let text = "";
+    const toolCalls = [];
+    for (const item of res.output) {
+      if (item.type === "message") {
+        for (const part of item.content) {
+          if (part.type === "output_text") text += part.text + "\n";
+        }
+      } else if (item.type === "function_call") {
+        toolCalls.push({
+          id: item.call_id,
+          name: item.name,
+          input: safeJson(item.arguments)
+        });
       }
+    }
+    const details = res.usage?.input_tokens_details;
+    const cacheRead = details?.cached_tokens ?? 0;
+    const cacheWrite = details?.cache_write_tokens ?? 0;
+    const usage = {
+      inputFull: Math.max(0, (res.usage?.input_tokens ?? 0) - cacheRead - cacheWrite),
+      cacheWrite,
+      cacheRead,
+      output: res.usage?.output_tokens ?? 0
     };
+    if (res.status === "incomplete") {
+      const reason = res.incomplete_details?.reason;
+      return {
+        text,
+        toolCalls: [],
+        done: true,
+        failure: reason === "max_output_tokens" ? "The model ran out of output tokens in the middle of a step." : `The model stopped early (${reason ?? "incomplete response"}).`,
+        usage
+      };
+    }
+    return { text, toolCalls, done: toolCalls.length === 0, usage };
   }
   submitToolResults(results) {
     for (const r of results) {
-      this.messages.push({
-        role: "tool",
-        tool_call_id: r.id,
-        content: r.content
+      this.input.push({
+        type: "function_call_output",
+        call_id: r.id,
+        // Function outputs have no error flag — say so in the text.
+        output: r.isError ? `Error: ${r.content}` : r.content
       });
     }
   }
@@ -22211,12 +22269,17 @@ You work across many different codebases and languages \u2014 do not assume a pa
 5. Write a minimal, surgical fix. Change only what is necessary to fix this specific bug.
 6. Use create_pull_request to open the fix with a clear, structured description.
 
-\u2550\u2550\u2550 RULES \u2550\u2550\u2550
-- Fix only what is broken. Keep the diff minimal \u2014 no unrelated refactors, renames, or reformatting.
-- Do not add dependencies. Do not add or modify test files.
-- Do not leave TODO comments \u2014 either implement the fix or explain the uncertainty in the PR body.
+\u2550\u2550\u2550 RULES (always apply) \u2550\u2550\u2550
 - You have a hard limit of 30 tool calls. If you reach it, stop and summarize what you found.
+- Deliver the fix only through create_pull_request.
+- Never put secrets, credentials or personal data into code, branch names, commits or the PR.
+- Do not leave TODO comments \u2014 either implement the fix or explain the uncertainty in the PR body.
 - If you cannot determine a confident fix, still open a PR but implement only a safe defensive guard (e.g. a null check or early return) and add an "\u26A0\uFE0F Uncertain fix" section explaining what the reviewer must verify.
+
+\u2550\u2550\u2550 DEFAULTS (the team instructions below may override these) \u2550\u2550\u2550
+- Fix only what is broken. Keep the diff minimal \u2014 no unrelated refactors, renames, or reformatting.
+- Do not add dependencies.
+- Do not add or modify test files.
 
 \u2550\u2550\u2550 PULL REQUEST FORMAT \u2550\u2550\u2550
 - Branch name: fix/<short-kebab-slug> (max ~60 chars).
@@ -22235,7 +22298,7 @@ You work across many different codebases and languages \u2014 do not assume a pa
 ## Issue
 [Link to the original issue.]
 ${opts.customInstructions ? `
-\u2550\u2550\u2550 TEAM CONVENTIONS (follow these) \u2550\u2550\u2550
+\u2550\u2550\u2550 TEAM INSTRUCTIONS (follow these; they take precedence over the defaults above) \u2550\u2550\u2550
 ${opts.customInstructions}
 ` : ""}`;
 }
@@ -22253,26 +22316,170 @@ ${opts.stacktrace}
 Explore the relevant files, identify the root cause, and open a pull request with the fix.`;
 }
 
-// action/src/agent/cost.ts
-var MODEL_PRICING = {
-  "claude-sonnet-4-6": { input: 3, output: 15 },
-  "claude-opus-4-8": { input: 5, output: 25 },
-  "claude-opus-4-6": { input: 5, output: 25 },
-  // OpenAI. Per-MTok input / output.
-  "gpt-5.5": { input: 5, output: 30 },
-  "gpt-5.4": { input: 2.5, output: 15 },
-  "gpt-5.4-mini": { input: 0.75, output: 4.5 }
+// src/lib/models.ts
+var STANDARD_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+function openAiPricing(r) {
+  return {
+    ...r,
+    longContext: {
+      aboveTokens: 272e3,
+      input: r.input * 2,
+      cacheWrite: r.cacheWrite * 2,
+      cacheRead: r.cacheRead * 2,
+      output: r.output * 1.5
+    }
+  };
+}
+var MODELS = [
+  {
+    id: "claude-opus-5-5",
+    provider: "anthropic",
+    label: "Claude Opus 5.5",
+    description: "Best for most fixes",
+    efforts: STANDARD_EFFORTS,
+    defaultEffort: "medium",
+    pricing: { input: 4, cacheWrite: 5, cacheRead: 0.2, output: 20 },
+    recommended: true
+  },
+  {
+    id: "claude-sonnet-5-5",
+    provider: "anthropic",
+    label: "Claude Sonnet 5.5",
+    description: "Faster, at half the price",
+    efforts: STANDARD_EFFORTS,
+    defaultEffort: "high",
+    pricing: { input: 2, cacheWrite: 2.5, cacheRead: 0.1, output: 10 }
+  },
+  {
+    id: "claude-fable-5-1",
+    provider: "anthropic",
+    label: "Claude Fable 5.1",
+    description: "The hardest bugs and long investigations",
+    efforts: STANDARD_EFFORTS,
+    defaultEffort: "high",
+    pricing: { input: 10, cacheWrite: 12.5, cacheRead: 0.25, output: 50 }
+  },
+  {
+    id: "claude-haiku-5-5",
+    provider: "anthropic",
+    label: "Claude Haiku 5.5",
+    description: "Cheapest, for simple errors",
+    efforts: STANDARD_EFFORTS,
+    defaultEffort: "medium",
+    pricing: {
+      input: 0.1,
+      cacheWrite: 0.125,
+      cacheRead: 0.01,
+      output: 0.5,
+      longContext: { aboveTokens: 1e5, input: 0.5, cacheWrite: 0.625, cacheRead: 0.05, output: 2.5 }
+    }
+  },
+  {
+    id: "gpt-6.1-sol",
+    provider: "openai",
+    label: "GPT-6.1 Sol",
+    description: "Near-Astra quality at a lower cost",
+    efforts: STANDARD_EFFORTS,
+    defaultEffort: "medium",
+    pricing: openAiPricing({ input: 2, cacheWrite: 2.5, cacheRead: 0.1, output: 10 }),
+    recommended: true
+  },
+  {
+    id: "gpt-6-astra",
+    provider: "openai",
+    label: "GPT-6 Astra",
+    description: "OpenAI's most capable model",
+    efforts: STANDARD_EFFORTS,
+    defaultEffort: "medium",
+    pricing: openAiPricing({ input: 10, cacheWrite: 12.5, cacheRead: 1, output: 50 })
+  },
+  {
+    id: "gpt-6-luna",
+    provider: "openai",
+    label: "GPT-6 Luna",
+    description: "Cheapest, for simple errors",
+    efforts: ["none", ...STANDARD_EFFORTS],
+    defaultEffort: "medium",
+    pricing: openAiPricing({ input: 0.1, cacheWrite: 0.125, cacheRead: 0.01, output: 0.5 })
+  }
+];
+var LEGACY_MODELS = {
+  "claude-sonnet-4-6": {
+    provider: "anthropic",
+    label: "Claude Sonnet 4.6",
+    successor: "claude-sonnet-5-5",
+    pricing: { input: 3, cacheWrite: 3.75, cacheRead: 0.3, output: 15 }
+  },
+  "claude-opus-4-8": {
+    provider: "anthropic",
+    label: "Claude Opus 4.8",
+    successor: "claude-opus-5-5",
+    pricing: { input: 5, cacheWrite: 6.25, cacheRead: 0.5, output: 25 }
+  },
+  "claude-opus-4-6": {
+    provider: "anthropic",
+    label: "Claude Opus 4.6",
+    successor: "claude-opus-5-5",
+    pricing: { input: 5, cacheWrite: 6.25, cacheRead: 0.5, output: 25 }
+  },
+  "gpt-5.5": {
+    provider: "openai",
+    label: "GPT-5.5",
+    successor: "gpt-6-astra",
+    pricing: { input: 5, cacheWrite: 5, cacheRead: 0.5, output: 30 }
+  },
+  "gpt-5.4": {
+    provider: "openai",
+    label: "GPT-5.4",
+    successor: "gpt-6.1-sol",
+    pricing: { input: 2.5, cacheWrite: 2.5, cacheRead: 0.25, output: 15 }
+  },
+  "gpt-5.4-mini": {
+    provider: "openai",
+    label: "GPT-5.4 mini",
+    successor: "gpt-6-luna",
+    pricing: { input: 0.75, cacheWrite: 0.75, cacheRead: 0.075, output: 4.5 }
+  }
 };
-function estimateCostUsd(model, usage) {
-  const price = MODEL_PRICING[model] ?? MODEL_PRICING["claude-sonnet-4-6"];
-  const inputCost = (usage.inputFull + usage.cacheWrite * 1.25 + usage.cacheRead * 0.1) * (price.input / 1e6);
-  const outputCost = usage.output * (price.output / 1e6);
-  return inputCost + outputCost;
+var DEFAULT_MODEL = {
+  anthropic: "claude-opus-5-5",
+  openai: "gpt-6.1-sol"
+};
+function findModel(id) {
+  return MODELS.find((m) => m.id === id);
+}
+function pricingFor(id) {
+  return findModel(id)?.pricing ?? LEGACY_MODELS[id]?.pricing;
+}
+
+// action/src/agent/cost.ts
+var warned = /* @__PURE__ */ new Set();
+function estimateCostUsd(model, provider, usage) {
+  let pricing = pricingFor(model);
+  if (!pricing) {
+    if (!warned.has(model)) {
+      warned.add(model);
+      console.warn(`bugzero: no pricing for model "${model}" \u2014 estimating with ${DEFAULT_MODEL[provider]}.`);
+    }
+    pricing = pricingFor(DEFAULT_MODEL[provider]);
+  }
+  const prompt = usage.inputFull + usage.cacheWrite + usage.cacheRead;
+  const r = pricing.longContext && prompt > pricing.longContext.aboveTokens ? pricing.longContext : pricing;
+  return (usage.inputFull * r.input + usage.cacheWrite * r.cacheWrite + usage.cacheRead * r.cacheRead + usage.output * r.output) / 1e6;
 }
 
 // action/src/agent/loop.ts
 var MAX_TOOL_CALLS = 30;
 var MAX_WALL_CLOCK_MS = 20 * 6e4;
+var TIME_LIMIT_REASON = "The agent hit its 20-minute time limit before opening a pull request.";
+function describeModelError(err) {
+  const status = err?.status;
+  const message = (err instanceof Error ? err.message : String(err)).slice(0, 400);
+  if (status === 401 || status === 403) {
+    return `The AI provider rejected the API key (${status}). Check the key in your repository's Actions secrets.`;
+  }
+  return `The AI provider returned an error${status ? ` (${status})` : ""}: ${message}`;
+}
 async function runAgentLoop(job, executor, opts) {
   const maxToolCalls = opts?.maxToolCalls ?? MAX_TOOL_CALLS;
   const maxWallClockMs = opts?.maxWallClockMs ?? MAX_WALL_CLOCK_MS;
@@ -22280,7 +22487,7 @@ async function runAgentLoop(job, executor, opts) {
     apiKey: job.apiKey,
     model: job.model,
     effort: job.effort,
-    adaptiveThinking: job.adaptiveThinking,
+    cacheKey: `bugzero-${job.runId}`,
     system: buildSystemPrompt({
       repoFullName: job.repoFullName,
       branch: job.branch,
@@ -22302,13 +22509,29 @@ async function runAgentLoop(job, executor, opts) {
   let summaryText = "";
   let toolCalls = 0;
   let pr = null;
-  const start = Date.now();
-  while (toolCalls < maxToolCalls && Date.now() - start < maxWallClockMs) {
-    const turn = await adapter.next();
+  let stopReason = null;
+  const deadline = Date.now() + maxWallClockMs;
+  while (toolCalls < maxToolCalls) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      stopReason = TIME_LIMIT_REASON;
+      break;
+    }
+    let turn;
+    try {
+      turn = await adapter.next(AbortSignal.timeout(remaining));
+    } catch (err) {
+      stopReason = Date.now() >= deadline - 1e3 ? TIME_LIMIT_REASON : describeModelError(err);
+      break;
+    }
     inputTokens += turn.usage.inputFull + turn.usage.cacheWrite + turn.usage.cacheRead;
     outputTokens += turn.usage.output;
-    cost += estimateCostUsd(job.model, turn.usage);
+    cost += estimateCostUsd(job.model, job.provider, turn.usage);
     if (turn.text) summaryText += turn.text;
+    if (turn.failure) {
+      stopReason = turn.failure;
+      break;
+    }
     if (turn.done || turn.toolCalls.length === 0) break;
     const results = [];
     for (const call of turn.toolCalls) {
@@ -22339,7 +22562,7 @@ async function runAgentLoop(job, executor, opts) {
     status = "SUCCESS";
   } else {
     status = "FAILED";
-    failureReason = summary.slice(0, 1e3) || "The agent finished without opening a pull request.";
+    failureReason = stopReason ?? (toolCalls >= maxToolCalls ? `The agent used all ${maxToolCalls} tool calls without opening a pull request.` : null) ?? (summary.slice(0, 1e3) || "The agent finished without opening a pull request.");
   }
   return {
     status,
@@ -22537,9 +22760,17 @@ var runId = input("run-id");
 var token = input("callback-token");
 var githubToken = input("github-token");
 if (token) console.log(`::add-mask::${token}`);
+function runnerUrl() {
+  const { GITHUB_SERVER_URL, GITHUB_REPOSITORY, GITHUB_RUN_ID } = process.env;
+  return GITHUB_SERVER_URL && GITHUB_REPOSITORY && GITHUB_RUN_ID ? `${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}` : null;
+}
 async function fetchContext() {
+  const url = runnerUrl();
   const res = await fetch(`${controlPlane}/api/runs/${runId}/context`, {
-    headers: { "x-bugzero-run-token": token }
+    headers: {
+      "x-bugzero-run-token": token,
+      ...url ? { "x-bugzero-runner-url": url } : {}
+    }
   });
   if (!res.ok) throw new Error(`Could not fetch run context (${res.status}).`);
   return await res.json();
@@ -22576,8 +22807,8 @@ async function main() {
       provider,
       model: ctx.model,
       effort: ctx.effort,
-      adaptiveThinking: ctx.adaptiveThinking,
       apiKey,
+      runId,
       repoFullName: ctx.repoFullName,
       branch: ctx.branch,
       errorTitle: ctx.errorTitle,

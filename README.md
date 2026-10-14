@@ -1,14 +1,18 @@
 # bugzero agent action
 
-Runs the [bugzero](https://bugzero.dev) fix agent **inside your own GitHub Actions
-runner**. When a monitored error fires, bugzero starts your `bugzero.yml` workflow
-(`workflow_dispatch`); this action reads the already checked-out code from disk, asks
-your own LLM (via a key you store as an Actions secret) for a minimal fix, opens a pull
-request, and reports the result back to bugzero.
+The [bugzero](https://bugzero.dev) bug-fixing agent, running **inside your own GitHub
+Actions runner**. When a monitored error fires in Sentry or PostHog, bugzero starts your
+`bugzero.yml` workflow (`workflow_dispatch`). This action reads the already checked-out
+code from disk, works out the root cause with the Claude or GPT model you picked in the
+bugzero dashboard (using your own key, stored as an Actions secret), opens a pull request
+with the fix, and reports the result back to bugzero.
+
+You steer the agent from the bugzero dashboard — model, effort, versioned team
+instructions and a daily safety cap — without touching this workflow.
 
 **Your source code and your AI key never leave your infrastructure.** bugzero's GitHub
 App has no access to repository contents — it can only start this workflow — and bugzero
-only ever receives run metadata (status, PR link, token counts).
+only ever receives run metadata (status, PR link, the agent's summary, token counts).
 
 ## Setup
 
