@@ -11820,10 +11820,7 @@ var init_sdk = __esm({
   }
 });
 
-// action/src/main.ts
-var import_node_fs2 = require("node:fs");
-
-// src/lib/agent/llm.ts
+// action/src/agent/llm.ts
 init_sdk();
 
 // node_modules/openai/internal/tslib.mjs
@@ -21960,7 +21957,7 @@ function isUndiciDispatcherVersionMismatchError(error) {
   return false;
 }
 
-// src/lib/agent/llm.ts
+// action/src/agent/llm.ts
 var ANTHROPIC_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 function anthropicEffort(e) {
   return ANTHROPIC_EFFORTS.includes(e) ? e : "high";
@@ -21978,8 +21975,15 @@ function safeJson(s) {
   }
 }
 var AnthropicAdapter = class {
+  client;
+  model;
+  effort;
+  adaptiveThinking;
+  system;
+  tools;
+  messages;
+  lastCached = null;
   constructor(o) {
-    this.lastCached = null;
     this.client = new Anthropic({ apiKey: o.apiKey });
     this.model = o.model;
     this.effort = anthropicEffort(o.effort);
@@ -22042,6 +22046,11 @@ var AnthropicAdapter = class {
   }
 };
 var OpenAIAdapter = class {
+  client;
+  model;
+  effort;
+  tools;
+  messages;
   constructor(o) {
     this.client = new OpenAI({ apiKey: o.apiKey });
     this.model = o.model;
@@ -22111,7 +22120,7 @@ function createAdapter(provider, opts) {
   return provider === "openai" ? new OpenAIAdapter(opts) : new AnthropicAdapter(opts);
 }
 
-// src/lib/agent/tools.ts
+// action/src/agent/tools.ts
 var AGENT_TOOLS = [
   {
     name: "get_file_contents",
@@ -22188,7 +22197,7 @@ var AGENT_TOOLS = [
   }
 ];
 
-// src/lib/agent/prompts.ts
+// action/src/agent/prompts.ts
 function buildSystemPrompt(opts) {
   return `You are an expert software engineer. Your job is to automatically fix a production bug reported by your error monitoring, in the repository ${opts.repoFullName} (target branch: ${opts.branch}).
 
@@ -22244,12 +22253,12 @@ ${opts.stacktrace}
 Explore the relevant files, identify the root cause, and ${opts.isDryRun ? "describe the fix you would make (no pull request)." : "open a pull request with the fix."}`;
 }
 
-// src/lib/agent/core/cost.ts
+// action/src/agent/cost.ts
 var MODEL_PRICING = {
   "claude-sonnet-4-6": { input: 3, output: 15 },
   "claude-opus-4-8": { input: 5, output: 25 },
   "claude-opus-4-6": { input: 5, output: 25 },
-  // OpenAI (BYOK only). Per-MTok input / output.
+  // OpenAI. Per-MTok input / output.
   "gpt-5.5": { input: 5, output: 30 },
   "gpt-5.4": { input: 2.5, output: 15 },
   "gpt-5.4-mini": { input: 0.75, output: 4.5 }
@@ -22261,9 +22270,9 @@ function estimateCostUsd(model, usage) {
   return inputCost + outputCost;
 }
 
-// src/lib/agent/core/loop.ts
+// action/src/agent/loop.ts
 var MAX_TOOL_CALLS = 30;
-var MAX_WALL_CLOCK_MS = 74e4;
+var MAX_WALL_CLOCK_MS = 20 * 6e4;
 async function runAgentLoop(job, executor, opts) {
   const maxToolCalls = opts?.maxToolCalls ?? MAX_TOOL_CALLS;
   const maxWallClockMs = opts?.maxWallClockMs ?? MAX_WALL_CLOCK_MS;
@@ -22528,21 +22537,14 @@ function isExit(e, code) {
 function input(name) {
   return process.env[`INPUT_${name.replace(/ /g, "_").toUpperCase()}`] ?? "";
 }
-function payloadControlPlane() {
-  try {
-    const path7 = process.env.GITHUB_EVENT_PATH;
-    if (!path7) return "";
-    const event = JSON.parse((0, import_node_fs2.readFileSync)(path7, "utf8"));
-    const url = event.client_payload?.control_plane;
-    return typeof url === "string" ? url : "";
-  } catch {
-    return "";
-  }
-}
-var controlPlane = (input("control-plane") || payloadControlPlane() || "https://bugzero.dev").replace(/\/+$/, "");
+var controlPlane = (input("control-plane") || "https://bugzero.dev").replace(
+  /\/+$/,
+  ""
+);
 var runId = input("run-id");
 var token = input("callback-token");
 var githubToken = input("github-token");
+if (token) console.log(`::add-mask::${token}`);
 async function fetchContext() {
   const res = await fetch(`${controlPlane}/api/runs/${runId}/context`, {
     headers: { "x-bugzero-run-token": token }
@@ -22594,8 +22596,7 @@ async function main() {
       stacktrace: ctx.stacktrace,
       customInstructions: ctx.customInstructions
     },
-    executor,
-    { maxWallClockMs: 20 * 6e4 }
+    executor
   );
   await postResult(result);
   console.log(`bugzero: run ${runId} finished \u2014 ${result.status}.`);

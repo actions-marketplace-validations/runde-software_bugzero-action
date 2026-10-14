@@ -1,41 +1,66 @@
 # bugzero agent action
 
 Runs the [bugzero](https://bugzero.dev) fix agent **inside your own GitHub Actions
-runner**. When a monitored error fires, bugzero dispatches a `bugzero-fix` event; this
-action clones nothing new (the repo is already checked out), reads the code from disk,
-asks your own LLM (via a key you store as an Actions secret) for a minimal fix, opens a
-pull request, and reports the result back to bugzero.
+runner**. When a monitored error fires, bugzero starts your `bugzero.yml` workflow
+(`workflow_dispatch`); this action reads the already checked-out code from disk, asks
+your own LLM (via a key you store as an Actions secret) for a minimal fix, opens a pull
+request, and reports the result back to bugzero.
 
-**Your source code and your AI key never leave your infrastructure.** bugzero only ever
-receives run metadata (status, PR link, token counts).
+**Your source code and your AI key never leave your infrastructure.** bugzero's GitHub
+App has no access to repository contents — it can only start this workflow — and bugzero
+only ever receives run metadata (status, PR link, token counts).
 
 ## Setup
 
-1. Add the workflow at `.github/workflows/bugzero.yml` (bugzero can open this PR for you):
+1. Add the workflow at `.github/workflows/bugzero.yml` and commit it to your default
+   branch (the bugzero dashboard links you to GitHub with this file prefilled):
 
    ```yaml
    name: bugzero auto-fix
+   run-name: bugzero fix ${{ inputs.run_id }}
+   # bugzero starts this workflow when a new error needs a fix. The agent runs here, in
+   # your runner — your code and your AI key never leave your infrastructure.
    on:
-     repository_dispatch:
-       types: [bugzero-fix]
+     workflow_dispatch:
+       inputs:
+         run_id:
+           description: bugzero run id
+           required: true
+           type: string
+         base_branch:
+           description: Branch to fix
+           required: true
+           type: string
+         token:
+           description: Per-run callback token
+           required: true
+           type: string
+         control_plane:
+           description: bugzero URL to report back to
+           required: false
+           type: string
    permissions:
      contents: write
      pull-requests: write
    jobs:
      fix:
        runs-on: ubuntu-latest
+       timeout-minutes: 25
        steps:
          - uses: actions/checkout@v4
            with:
-             ref: ${{ github.event.client_payload.base_branch }}
+             ref: ${{ inputs.base_branch }}
              fetch-depth: 0
          - uses: runde-software/bugzero-action@v1
            with:
-             run-id: ${{ github.event.client_payload.run_id }}
-             callback-token: ${{ github.event.client_payload.token }}
+             run-id: ${{ inputs.run_id }}
+             callback-token: ${{ inputs.token }}
+             control-plane: ${{ inputs.control_plane }}
            env:
+             # Add your AI provider key as a repository Actions secret. bugzero never
+             # sees it — it only exists here, in your runner.
              ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-             # Using OpenAI instead? Use this line instead of the one above:
+             # Using OpenAI instead? Set OPENAI_API_KEY and remove the line above:
              # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
    ```
 
