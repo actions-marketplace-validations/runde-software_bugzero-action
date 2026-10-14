@@ -11820,6 +11820,9 @@ var init_sdk = __esm({
   }
 });
 
+// action/src/main.ts
+var import_node_fs2 = require("node:fs");
+
 // src/lib/agent/llm.ts
 init_sdk();
 
@@ -22525,10 +22528,18 @@ function isExit(e, code) {
 function input(name) {
   return process.env[`INPUT_${name.replace(/ /g, "_").toUpperCase()}`] ?? "";
 }
-var controlPlane = (input("control-plane") || "https://app.bugzero.dev").replace(
-  /\/+$/,
-  ""
-);
+function payloadControlPlane() {
+  try {
+    const path7 = process.env.GITHUB_EVENT_PATH;
+    if (!path7) return "";
+    const event = JSON.parse((0, import_node_fs2.readFileSync)(path7, "utf8"));
+    const url = event.client_payload?.control_plane;
+    return typeof url === "string" ? url : "";
+  } catch {
+    return "";
+  }
+}
+var controlPlane = (input("control-plane") || payloadControlPlane() || "https://bugzero.dev").replace(/\/+$/, "");
 var runId = input("run-id");
 var token = input("callback-token");
 var githubToken = input("github-token");

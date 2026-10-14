@@ -12,13 +12,12 @@ inputs:
     description: "Per-run token used to fetch context and post the result."
     required: true
   control-plane:
-    description: "bugzero control-plane base URL."
+    description: "bugzero control-plane base URL. Defaults to the URL bugzero sends in the dispatch payload (falling back to https://bugzero.dev)."
     required: false
-    default: "https://app.bugzero.dev"
   github-token:
     description: "Token used to push the fix branch and open the PR."
     required: false
     default: ${{ github.token }}
 runs:
-  using: "node20"
+  using: "node24"
   main: "dist/index.js"

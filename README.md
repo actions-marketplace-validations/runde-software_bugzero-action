@@ -35,6 +35,8 @@ receives run metadata (status, PR link, token counts).
              callback-token: ${{ github.event.client_payload.token }}
            env:
              ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+             # Using OpenAI instead? Use this line instead of the one above:
+             # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
    ```
 
 2. Add your `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY`) as a repository **Actions secret**.
