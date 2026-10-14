@@ -22163,18 +22163,18 @@ var AGENT_TOOLS = [
   },
   {
     name: "create_pull_request",
-    description: "Create a branch with the fixed file(s) and open a pull request. Call this ONLY when you have a complete fix ready. Disabled in dry-run mode.",
+    description: "Create a branch with the fixed file(s) and open a pull request. Call this ONLY when you have a complete fix ready.",
     input_schema: {
       type: "object",
       properties: {
         branch_name: {
           type: "string",
-          description: "Branch name for the fix, e.g. fix/sentry-123-null-user"
+          description: "Branch name for the fix, e.g. fix/null-user-in-get-user"
         },
         pr_title: { type: "string", description: "Concise, descriptive PR title." },
         pr_body: {
           type: "string",
-          description: "PR description in Markdown with Root Cause, Fix, How to Verify, and Sentry link sections."
+          description: "PR description in Markdown with Root Cause, Fix, How to Verify, and Issue link sections."
         },
         files: {
           type: "array",
@@ -22209,16 +22209,16 @@ You work across many different codebases and languages \u2014 do not assume a pa
 3. Use list_directory and search_code to understand structure and find related code as needed.
 4. Identify the ROOT CAUSE \u2014 not just where it crashes, but why.
 5. Write a minimal, surgical fix. Change only what is necessary to fix this specific bug.
-${opts.isDryRun ? "6. DRY RUN: do NOT open a pull request. Instead, end your turn with a clear written summary of the root cause and the exact change you would make (including the file path and a code snippet of the fix)." : "6. Use create_pull_request to open the fix with a clear, structured description."}
+6. Use create_pull_request to open the fix with a clear, structured description.
 
 \u2550\u2550\u2550 RULES \u2550\u2550\u2550
 - Fix only what is broken. Keep the diff minimal \u2014 no unrelated refactors, renames, or reformatting.
 - Do not add dependencies. Do not add or modify test files.
 - Do not leave TODO comments \u2014 either implement the fix or explain the uncertainty in the PR body.
 - You have a hard limit of 30 tool calls. If you reach it, stop and summarize what you found.
-- If you cannot determine a confident fix, ${opts.isDryRun ? "explain what you found and what additional context is needed." : 'still open a PR but implement only a safe defensive guard (e.g. a null check or early return) and add an "\u26A0\uFE0F Uncertain fix" section explaining what the reviewer must verify.'}
+- If you cannot determine a confident fix, still open a PR but implement only a safe defensive guard (e.g. a null check or early return) and add an "\u26A0\uFE0F Uncertain fix" section explaining what the reviewer must verify.
 
-${opts.isDryRun ? "" : `\u2550\u2550\u2550 PULL REQUEST FORMAT \u2550\u2550\u2550
+\u2550\u2550\u2550 PULL REQUEST FORMAT \u2550\u2550\u2550
 - Branch name: fix/<short-kebab-slug> (max ~60 chars).
 - PR title: concise, describing what was broken and how it was fixed.
 - PR body must use this structure:
@@ -22234,7 +22234,7 @@ ${opts.isDryRun ? "" : `\u2550\u2550\u2550 PULL REQUEST FORMAT \u2550\u2550\u255
 
 ## Issue
 [Link to the original issue.]
-`}${opts.customInstructions ? `
+${opts.customInstructions ? `
 \u2550\u2550\u2550 TEAM CONVENTIONS (follow these) \u2550\u2550\u2550
 ${opts.customInstructions}
 ` : ""}`;
@@ -22245,12 +22245,12 @@ function buildUserMessage(opts) {
 Repository: ${opts.repoFullName} (branch: ${opts.branch})
 Error: ${opts.errorTitle}
 Type: ${opts.errorType}
-Issue link: ${opts.sentryIssueUrl}
+Issue link: ${opts.issueUrl}
 
 Stacktrace:
 ${opts.stacktrace}
 
-Explore the relevant files, identify the root cause, and ${opts.isDryRun ? "describe the fix you would make (no pull request)." : "open a pull request with the fix."}`;
+Explore the relevant files, identify the root cause, and open a pull request with the fix.`;
 }
 
 // action/src/agent/cost.ts
@@ -22276,7 +22276,6 @@ var MAX_WALL_CLOCK_MS = 20 * 6e4;
 async function runAgentLoop(job, executor, opts) {
   const maxToolCalls = opts?.maxToolCalls ?? MAX_TOOL_CALLS;
   const maxWallClockMs = opts?.maxWallClockMs ?? MAX_WALL_CLOCK_MS;
-  const tools = job.isDryRun ? AGENT_TOOLS.filter((t) => t.name !== "create_pull_request") : AGENT_TOOLS;
   const adapter = createAdapter(job.provider, {
     apiKey: job.apiKey,
     model: job.model,
@@ -22285,19 +22284,17 @@ async function runAgentLoop(job, executor, opts) {
     system: buildSystemPrompt({
       repoFullName: job.repoFullName,
       branch: job.branch,
-      isDryRun: job.isDryRun,
       customInstructions: job.customInstructions
     }),
     userMessage: buildUserMessage({
       errorTitle: job.errorTitle,
       errorType: job.errorType,
-      sentryIssueUrl: job.issueUrl,
+      issueUrl: job.issueUrl,
       stacktrace: job.stacktrace,
       repoFullName: job.repoFullName,
-      branch: job.branch,
-      isDryRun: job.isDryRun
+      branch: job.branch
     }),
-    tools
+    tools: AGENT_TOOLS
   });
   let inputTokens = 0;
   let outputTokens = 0;
@@ -22340,8 +22337,6 @@ async function runAgentLoop(job, executor, opts) {
   let failureReason = null;
   if (pr) {
     status = "SUCCESS";
-  } else if (job.isDryRun) {
-    status = "DRY_RUN_COMPLETE";
   } else {
     status = "FAILED";
     failureReason = summary.slice(0, 1e3) || "The agent finished without opening a pull request.";
@@ -22391,9 +22386,6 @@ var LocalToolExecutor = class {
           isError: false
         };
       case "create_pull_request": {
-        if (this.opts.isDryRun) {
-          return { content: "Dry run \u2014 no pull request opened.", isError: false };
-        }
         const pr = await this.createPr(call.input);
         return {
           content: JSON.stringify({ pr_url: pr.prUrl, pr_number: pr.prNumber }),
@@ -22577,8 +22569,7 @@ async function main() {
     owner,
     repo,
     baseBranch: ctx.branch,
-    githubToken,
-    isDryRun: ctx.isDryRun
+    githubToken
   });
   const result = await runAgentLoop(
     {
@@ -22589,7 +22580,6 @@ async function main() {
       apiKey,
       repoFullName: ctx.repoFullName,
       branch: ctx.branch,
-      isDryRun: ctx.isDryRun,
       errorTitle: ctx.errorTitle,
       errorType: ctx.errorType,
       issueUrl: ctx.issueUrl,
