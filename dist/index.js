@@ -21959,8 +21959,6 @@ function isUndiciDispatcherVersionMismatchError(error) {
 
 // action/src/agent/llm.ts
 var MAX_OUTPUT_TOKENS = 64e3;
-var ANTHROPIC_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
-var OPENAI_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 function safeJson(s) {
   try {
     const v = JSON.parse(s);
@@ -22009,7 +22007,7 @@ var AnthropicAdapter = class {
   constructor(o) {
     this.client = new Anthropic({ apiKey: o.apiKey });
     this.model = o.model;
-    this.effort = ANTHROPIC_EFFORTS.includes(o.effort) ? o.effort : null;
+    this.effort = o.effort ? o.effort : null;
     this.system = [
       { type: "text", text: o.system, cache_control: { type: "ephemeral" } }
     ];
@@ -22094,7 +22092,7 @@ var OpenAIAdapter = class {
   constructor(o) {
     this.client = new OpenAI({ apiKey: o.apiKey });
     this.model = o.model;
-    this.effort = OPENAI_EFFORTS.includes(o.effort) ? o.effort : null;
+    this.effort = o.effort || null;
     this.system = o.system;
     this.cacheKey = o.cacheKey;
     this.tools = o.tools.map((t) => ({
@@ -22451,6 +22449,11 @@ function findModel(id) {
 function pricingFor(id) {
   return findModel(id)?.pricing ?? LEGACY_MODELS[id]?.pricing;
 }
+function callCostUsd(pricing, usage) {
+  const prompt = usage.inputFull + usage.cacheWrite + usage.cacheRead;
+  const r = pricing.longContext && prompt > pricing.longContext.aboveTokens ? pricing.longContext : pricing;
+  return (usage.inputFull * r.input + usage.cacheWrite * r.cacheWrite + usage.cacheRead * r.cacheRead + usage.output * r.output) / 1e6;
+}
 
 // action/src/agent/cost.ts
 var warned = /* @__PURE__ */ new Set();
@@ -22459,13 +22462,13 @@ function estimateCostUsd(model, provider, usage) {
   if (!pricing) {
     if (!warned.has(model)) {
       warned.add(model);
-      console.warn(`bugzero: no pricing for model "${model}" \u2014 estimating with ${DEFAULT_MODEL[provider]}.`);
+      console.warn(
+        `bugzero: model "${model}" isn't in this action's price list \u2014 estimating with ${DEFAULT_MODEL[provider]} (bugzero prices it exactly).`
+      );
     }
     pricing = pricingFor(DEFAULT_MODEL[provider]);
   }
-  const prompt = usage.inputFull + usage.cacheWrite + usage.cacheRead;
-  const r = pricing.longContext && prompt > pricing.longContext.aboveTokens ? pricing.longContext : pricing;
-  return (usage.inputFull * r.input + usage.cacheWrite * r.cacheWrite + usage.cacheRead * r.cacheRead + usage.output * r.output) / 1e6;
+  return callCostUsd(pricing, usage);
 }
 
 // action/src/agent/loop.ts
@@ -22509,6 +22512,7 @@ async function runAgentLoop(job, executor, opts) {
   let summaryText = "";
   let toolCalls = 0;
   let pr = null;
+  const usageByCall = [];
   let stopReason = null;
   const deadline = Date.now() + maxWallClockMs;
   while (toolCalls < maxToolCalls) {
@@ -22526,6 +22530,7 @@ async function runAgentLoop(job, executor, opts) {
     }
     inputTokens += turn.usage.inputFull + turn.usage.cacheWrite + turn.usage.cacheRead;
     outputTokens += turn.usage.output;
+    usageByCall.push(turn.usage);
     cost += estimateCostUsd(job.model, job.provider, turn.usage);
     if (turn.text) summaryText += turn.text;
     if (turn.failure) {
@@ -22574,6 +22579,7 @@ async function runAgentLoop(job, executor, opts) {
     inputTokens,
     outputTokens,
     estimatedCostUsd: cost,
+    usageByCall,
     provider: job.provider,
     model: job.model
   };
