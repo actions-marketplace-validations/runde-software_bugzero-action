@@ -22333,7 +22333,6 @@ var MODELS = [
     id: "claude-opus-5-5",
     provider: "anthropic",
     label: "Claude Opus 5.5",
-    description: "Best for most fixes",
     efforts: STANDARD_EFFORTS,
     defaultEffort: "medium",
     pricing: { input: 4, cacheWrite: 5, cacheRead: 0.2, output: 20 },
@@ -22343,7 +22342,6 @@ var MODELS = [
     id: "claude-sonnet-5-5",
     provider: "anthropic",
     label: "Claude Sonnet 5.5",
-    description: "Faster, at half the price",
     efforts: STANDARD_EFFORTS,
     defaultEffort: "high",
     pricing: { input: 2, cacheWrite: 2.5, cacheRead: 0.1, output: 10 }
@@ -22352,7 +22350,6 @@ var MODELS = [
     id: "claude-fable-5-1",
     provider: "anthropic",
     label: "Claude Fable 5.1",
-    description: "The hardest bugs and long investigations",
     efforts: STANDARD_EFFORTS,
     defaultEffort: "high",
     pricing: { input: 10, cacheWrite: 12.5, cacheRead: 0.25, output: 50 }
@@ -22361,7 +22358,6 @@ var MODELS = [
     id: "claude-haiku-5-5",
     provider: "anthropic",
     label: "Claude Haiku 5.5",
-    description: "Cheapest, for simple errors",
     efforts: STANDARD_EFFORTS,
     defaultEffort: "medium",
     pricing: {
@@ -22376,7 +22372,6 @@ var MODELS = [
     id: "gpt-6.1-sol",
     provider: "openai",
     label: "GPT-6.1 Sol",
-    description: "Near-Astra quality at a lower cost",
     efforts: STANDARD_EFFORTS,
     defaultEffort: "medium",
     pricing: openAiPricing({ input: 2, cacheWrite: 2.5, cacheRead: 0.1, output: 10 }),
@@ -22386,7 +22381,6 @@ var MODELS = [
     id: "gpt-6-astra",
     provider: "openai",
     label: "GPT-6 Astra",
-    description: "OpenAI's most capable model",
     efforts: STANDARD_EFFORTS,
     defaultEffort: "medium",
     pricing: openAiPricing({ input: 10, cacheWrite: 12.5, cacheRead: 1, output: 50 })
@@ -22395,7 +22389,6 @@ var MODELS = [
     id: "gpt-6-luna",
     provider: "openai",
     label: "GPT-6 Luna",
-    description: "Cheapest, for simple errors",
     efforts: ["none", ...STANDARD_EFFORTS],
     defaultEffort: "medium",
     pricing: openAiPricing({ input: 0.1, cacheWrite: 0.125, cacheRead: 0.01, output: 0.5 })
@@ -22512,6 +22505,7 @@ async function runAgentLoop(job, executor, opts) {
   let summaryText = "";
   let toolCalls = 0;
   let pr = null;
+  let fatal = null;
   const usageByCall = [];
   let stopReason = null;
   const deadline = Date.now() + maxWallClockMs;
@@ -22551,6 +22545,7 @@ async function runAgentLoop(job, executor, opts) {
         };
       }
       if (outcome.pr) pr = outcome.pr;
+      if (outcome.fatal) fatal = outcome.fatal;
       results.push({
         id: call.id,
         content: outcome.content,
@@ -22558,7 +22553,7 @@ async function runAgentLoop(job, executor, opts) {
       });
     }
     adapter.submitToolResults(results);
-    if (pr) break;
+    if (pr || fatal) break;
   }
   const summary = summaryText.trim();
   let status;
@@ -22567,15 +22562,17 @@ async function runAgentLoop(job, executor, opts) {
     status = "SUCCESS";
   } else {
     status = "FAILED";
-    failureReason = stopReason ?? (toolCalls >= maxToolCalls ? `The agent used all ${maxToolCalls} tool calls without opening a pull request.` : null) ?? (summary.slice(0, 1e3) || "The agent finished without opening a pull request.");
+    failureReason = fatal?.reason ?? stopReason ?? (toolCalls >= maxToolCalls ? `The agent used all ${maxToolCalls} tool calls without opening a pull request.` : null) ?? (summary.slice(0, 1e3) || "The agent finished without opening a pull request.");
   }
+  const kept = [summary, fatal?.summary].filter(Boolean).join("\n\n");
   return {
     status,
     prUrl: pr?.prUrl ?? null,
     prNumber: pr?.prNumber ?? null,
-    prBranch: pr?.prBranch ?? null,
-    agentSummary: summary || (pr ? "Pull request opened." : "No summary."),
+    prBranch: pr?.prBranch ?? fatal?.branch ?? null,
+    agentSummary: kept || (pr ? "Pull request opened." : "No summary."),
     failureReason,
+    failureCode: fatal?.code ?? null,
     inputTokens,
     outputTokens,
     estimatedCostUsd: cost,
@@ -22592,6 +22589,26 @@ var import_node_util2 = require("node:util");
 var import_node_path = __toESM(require("node:path"));
 var execFileAsync2 = (0, import_node_util2.promisify)(import_node_child_process2.execFile);
 var MAX_FILE_CHARS = 5e4;
+var PR_NOT_PERMITTED = "pr_not_permitted";
+var GitHubApiError = class extends Error {
+  constructor(path7, status, detail) {
+    super(`GitHub API ${path7} failed (${status}): ${detail.slice(0, 300)}`);
+    this.status = status;
+    this.detail = detail;
+  }
+  status;
+  detail;
+};
+var PrNotOpenedError = class extends Error {
+  constructor(failure) {
+    super(failure.reason);
+    this.failure = failure;
+  }
+  failure;
+};
+function isPrCreationDisabled(err) {
+  return err instanceof GitHubApiError && err.status === 403 && /not permitted to create or approve pull requests/i.test(err.detail);
+}
 var LocalToolExecutor = class {
   constructor(opts) {
     this.opts = opts;
@@ -22615,12 +22632,19 @@ var LocalToolExecutor = class {
           isError: false
         };
       case "create_pull_request": {
-        const pr = await this.createPr(call.input);
-        return {
-          content: JSON.stringify({ pr_url: pr.prUrl, pr_number: pr.prNumber }),
-          isError: false,
-          pr
-        };
+        try {
+          const pr = await this.createPr(call.input);
+          return {
+            content: JSON.stringify({ pr_url: pr.prUrl, pr_number: pr.prNumber }),
+            isError: false,
+            pr
+          };
+        } catch (err) {
+          if (err instanceof PrNotOpenedError) {
+            return { content: err.failure.reason, isError: true, fatal: err.failure };
+          }
+          throw err;
+        }
       }
       default:
         return { content: `Unknown tool: ${call.name}`, isError: true };
@@ -22691,6 +22715,14 @@ var LocalToolExecutor = class {
     });
     return stdout;
   }
+  async remoteBranchExists(name) {
+    try {
+      await this.git(["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${name}`]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
   async createPr(input2) {
     for (const f of input2.files) {
       const abs = this.resolve(f.path);
@@ -22700,6 +22732,9 @@ var LocalToolExecutor = class {
     await this.git(["config", "user.name", "bugzero[bot]"]);
     await this.git(["config", "user.email", "bot@bugzero.dev"]);
     let branch = input2.branch_name;
+    if (await this.remoteBranchExists(branch)) {
+      branch = `${input2.branch_name}-${Date.now().toString(36)}`;
+    }
     try {
       await this.git(["checkout", "-b", branch]);
     } catch {
@@ -22711,15 +22746,37 @@ var LocalToolExecutor = class {
 
 Automated fix by bugzero`]);
     await this.git(["push", "-u", "origin", branch]);
-    const pr = await this.githubApi(
-      `/repos/${this.opts.owner}/${this.opts.repo}/pulls`,
-      {
-        title: input2.pr_title,
-        body: input2.pr_body,
-        head: branch,
-        base: this.opts.baseBranch
+    let pr;
+    try {
+      pr = await this.githubApi(
+        `/repos/${this.opts.owner}/${this.opts.repo}/pulls`,
+        {
+          title: input2.pr_title,
+          body: input2.pr_body,
+          head: branch,
+          base: this.opts.baseBranch
+        }
+      );
+    } catch (err) {
+      const summary = `${input2.pr_title}
+
+${input2.pr_body}`;
+      if (isPrCreationDisabled(err)) {
+        throw new PrNotOpenedError({
+          code: PR_NOT_PERMITTED,
+          reason: `The fix was committed and pushed to branch "${branch}", but GitHub refused to open the pull request: this repository doesn't allow GitHub Actions to create pull requests. Turn on "Allow GitHub Actions to create and approve pull requests" in the repository's Settings \u2192 Actions \u2192 General (an organization owner may have to allow it for the organization first), then retry the run \u2014 or open the pull request from the branch yourself.`,
+          branch,
+          summary
+        });
       }
-    );
+      const why = err instanceof Error ? err.message : String(err);
+      throw new PrNotOpenedError({
+        code: null,
+        reason: `The fix was committed and pushed to branch "${branch}", but opening the pull request failed: ${why}`,
+        branch,
+        summary
+      });
+    }
     await this.githubApi(
       `/repos/${this.opts.owner}/${this.opts.repo}/issues/${pr.number}/labels`,
       { labels: ["bug", "automated-fix", "needs-review"] }
@@ -22740,9 +22797,7 @@ Automated fix by bugzero`]);
     });
     if (!res.ok) {
       const detail = await res.text().catch(() => "");
-      throw new Error(
-        `GitHub API ${path7} failed (${res.status}): ${detail.slice(0, 300)}`
-      );
+      throw new GitHubApiError(path7, res.status, detail);
     }
     return await res.json();
   }
