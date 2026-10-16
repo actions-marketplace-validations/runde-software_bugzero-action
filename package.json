@@ -1,0 +1,20 @@
+{
+  "name": "bugzero-action",
+  "version": "1.5.1",
+  "private": true,
+  "description": "The bugzero bug-fixing agent as a GitHub Action.",
+  "license": "MIT",
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.106.0",
+    "openai": "6.45.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1",
+    "typescript": "5.9.3",
+    "@types/node": "20.19.43"
+  }
+}
